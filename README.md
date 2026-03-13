@@ -1,66 +1,70 @@
-### 🛡️ 核心机制：输入保护 (Input Protection Logic)
 
-这是该插件最关键的智能特性，解决了“清理内存时误删正在使用的数据”的痛点。
+### 🛡️ Core Mechanism: Input Protection Logic
 
-1.  **递归收集 (Recursive Collection)**:
-    *   当你将数据（如 `Model`, `Image`, `Latent`）连接到节点的输入端（`anything`, `data0` 等）时，代码会立即启动 `_collect_protected_ids` 函数。
-    *   它不仅记录你直接连接的物体 ID，还会**递归深入**物体内部。例如，如果你传入一个模型，它会自动找到模型内部的权重参数（Parameters）、缓冲区（Buffers）和子模块，将它们的内存地址 ID 全部加入“白名单”。
-    *   *代码对应*: `_collect_protected_ids` 函数中的 `nn.Module` 遍历逻辑。
+This is the plugin's most critical intelligent feature, solving the pain point of "accidentally deleting in-use data during memory cleanup."
 
-2.  **建立安全区 (Safe List)**:
-    *   所有收集到的 ID 被存入一个集合 (`collected set`)。这些对象被视为“正在使用中”，绝对不可触碰。
+1.  **Recursive Collection**:
+    *   When you connect data (such as `Model`, `Image`, `Latent`) to a node's input port (`anything`, `data0`, etc.), the code immediately triggers the `_collect_protected_ids` function.
+    *   It doesn't just record the ID of the directly connected object—it **recursively traverses** into the object's internals. For example, if you pass in a model, it automatically locates the model's internal weights (Parameters), buffers (Buffers), and sub-modules, adding all their memory address IDs to a "whitelist."
+    *   *Code reference*: The `nn.Module` traversal logic inside the `_collect_protected_ids` function.
 
-3.  **全局清扫 (Global Purge)**:
-    *   系统遍历 Python 垃圾回收器 (`gc.get_objects()`) 中的所有对象。
-    *   **比对**: 如果对象的 ID **不在**白名单中 -> **执行清理**（清空数据或解除引用）。
-    *   **跳过**: 如果对象的 ID **在**白名单中 -> **原样保留**。
+2.  **Establishing a Safe Zone (Safe List)**:
+    *   All collected IDs are stored in a set (`collected set`). These objects are marked as "in use" and must never be touched.
 
-4.  **结果**:
-    *   未被引用的垃圾内存被释放。
-    *   你连接在节点上的关键数据毫发无损，可以继续传递给下游节点。
+3.  **Global Sweep (Global Purge)**:
+    *   The system iterates through all objects in Python's garbage collector (`gc.get_objects()`).
+    *   **Comparison**: If an object's ID is **NOT** in the whitelist → **Execute cleanup** (zero out data or release references).
+    *   **Skip**: If an object's ID **IS** in the whitelist → **Preserve as-is**.
+
+4.  **Result**:
+    *   Unreferenced garbage memory is released.
+    *   Your critical data connected to the node inputs remains intact and can be passed to downstream nodes.
 
 ---
 
-### 🧹 节点功能详解 (Node Overview)
+### 🧹 Node Overview
 
-根据是否保留数据，节点分为两类：
+Nodes are categorized into two types based on whether they preserve and output data:
 
-#### 1. 终结型节点 (无输出，用于工作流末尾或独立步骤)
+#### 1. Terminal Nodes (No output, for workflow endpoints or standalone steps)
 *   **🧹 Purge VRAM**:
-    *   **功能**: 仅清理显存 (GPU)。调用 `torch.cuda.empty_cache()` 和 ComfyUI 的卸载逻辑。
-    *   **用途**: 生成完一张大图后，释放显存给其他程序，或者防止显存累积导致 OOM。
+    *   **Function**: Cleans GPU VRAM only. Calls `torch.cuda.empty_cache()` and ComfyUI's model unloading logic.
+    *   **Use Case**: After generating a large image, release VRAM for other applications, or prevent VRAM accumulation leading to OOM errors.
 *   **🧹 Purge RAM (Protected)**:
-    *   **功能**: 保守清理内存 (CPU)。**只清理 CPU 张量**，并解除未保护模型的引用。
-    *   **用途**: 日常清理，风险低，不会干扰 CUDA 上下文。
+    *   **Function**: Conservative CPU memory cleanup. **Only clears CPU tensors** and releases references of unprotected models.
+    *   **Use Case**: Routine cleanup with low risk; won't interfere with CUDA context.
 *   **🧹 Purge ALL**:
-    *   **功能**: 激进清理。尝试清空所有设备（包括 CUDA）的张量数据，并强力解除模型引用。
-    *   **用途**: 遇到严重内存泄漏或需要极限释放资源时使用。*注意：清理后的模型若未受保护将变为“僵尸”状态，不可再用。*
+    *   **Function**: Aggressive cleanup. Attempts to zero out tensor data on all devices (including CUDA) and forcefully releases model references.
+    *   **Use Case**: When encountering severe memory leaks or when maximum resource release is needed. *Note: Unprotected models cleaned by this node become "zombie" objects and cannot be reused.*
 
-#### 2. 透传型节点 (有输出，用于工作流中间)
+#### 2. Passthrough Nodes (With output, for mid-workflow use)
 *   **🧹 Purge & Pass**:
-    *   **功能**: 接收一个输入，执行清理逻辑（保护该输入），然后原样输出该输入。
-    *   **用途**: 放在两个重型节点之间。例如：`加载模型` -> `Purge & Pass` -> `采样器`。确保加载模型产生的临时垃圾被清理，但模型本身被保留传给采样器。
-    *   **Mode**: 可选 `VRAM` (仅清显存) 或 `RAM` (清内存+显存)。
+    *   **Function**: Receives one input, executes cleanup logic (protecting that input), then outputs the input unchanged.
+    *   **Use Case**: Place between two heavy nodes. Example: `Load Model` → `Purge & Pass` → `Sampler`. Ensures temporary garbage from model loading is cleaned while the model itself is preserved for the sampler.
+    *   **Mode**: Selectable `VRAM` (clean VRAM only) or `RAM` (clean both RAM and VRAM).
 *   **🧹 Purge & Pass Multi / Purge RAM Multi**:
-    *   **功能**: 支持同时连接最多 4 个输入 (`data0` - `data3`)。它会保护所有非空输入，清理其他无关内存。
-    *   **用途**: 复杂工作流，同时需要保留模型、VAE 和 ControlNet 权重，清理其他杂项。
+    *   **Function**: Supports up to 4 simultaneous inputs (`data0` - `data3`). Protects all non-empty inputs while cleaning unrelated memory.
+    *   **Use Case**: Complex workflows where you need to preserve multiple items simultaneously (e.g., Model, VAE, and ControlNet weights) while cleaning other miscellaneous data.
 
 ---
 
-### 📝 典型使用场景 (Usage Scenarios)
+### 📝 Typical Usage Scenarios
 
-#### 场景 A: 批量处理 (Batch Processing)
-*   **连接**: `图像` -> `处理节点` -> **`Purge & Pass`** -> `保存/下一轮`
-*   **目的**: 在处理大量图片时，防止中间产生的临时 Tensor 堆积。`Purge & Pass` 保证当前图片数据通过，同时清理掉上一轮留下的垃圾。
+#### Scenario A: Batch Processing
+*   **Connection**: `Image` → `Processing Node` → **`Purge & Pass`** → `Save/Next Iteration`
+*   **Purpose**: When processing large batches of images, prevent accumulation of intermediate temporary Tensors. `Purge & Pass` ensures the current image data passes through while cleaning up garbage left from the previous iteration.
 
-#### 场景 B: 工作流结束 (End of Workflow)
-*   **连接**: `最终输出` -> **`Purge VRAM`**
-*   **目的**: 任务完成后，彻底释放 GPU 显存，让电脑恢复流畅，方便进行其他游戏或渲染任务。
+#### Scenario B: End of Workflow
+*   **Connection**: `Final Output` → **`Purge VRAM`**
+*   **Purpose**: After task completion, thoroughly release GPU VRAM to restore system performance for other gaming or rendering tasks.
 
-#### 场景 C: 大模型加载 (Heavy Models)
-*   **连接**: `Checkpoint Loader` -> **`Purge RAM (Protected)`** -> `KSampler`
-*   **目的**: 加载大模型时会产生大量临时内存碎片。此节点确保模型权重被保护（因为连接了输入），同时清理掉加载过程中产生的无用缓存，为后续的采样步骤腾出最大内存空间。
+#### Scenario C: Loading Heavy Models
+*   **Connection**: `Checkpoint Loader` → **`Purge RAM (Protected)`** → `KSampler`
+*   **Purpose**: Loading large models generates significant temporary memory fragmentation. This node ensures model weights are protected (because they're connected as input) while cleaning useless caches generated during loading, freeing maximum memory for subsequent sampling steps.
 
-### ⚠️ 重要提示
-*   **“僵尸”模型**: 使用 `Purge ALL` 或 `Purge RAM` 且**未连接**模型输入时，内存中的模型会被清空内部参数。如果后续节点试图使用这些未被保护的模型，会报错或产生错误结果。**务必将需要保留的模型连接到节点的输入端！**
-*   **线程安全**: 代码已针对 ComfyUI 的单线程执行特性优化，但在极端多线程自定义节点环境下，两次 GC 快照可能存在微小差异。
+---
+
+### ⚠️ Important Notes
+
+*   **"Zombie" Models**: When using `Purge ALL` or `Purge RAM` **without** connecting a model to the input, models in memory will have their internal parameters zeroed out. If downstream nodes attempt to use these unprotected models afterward, errors or incorrect results may occur. **Always connect models you need to preserve to the node's input port!**
+*   **Thread Safety**: The code is optimized for ComfyUI's single-threaded execution model. However, in extreme multi-threaded custom node environments, minor discrepancies may exist between the two GC snapshots taken during cleanup.
